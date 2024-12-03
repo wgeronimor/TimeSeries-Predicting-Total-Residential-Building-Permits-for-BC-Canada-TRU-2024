@@ -1,0 +1,496 @@
+---
+title: "Predicting Total Residential Building Permits in British Columbia"
+date: "2024-12-02"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(fpp3)
+library(readxl) # For reading Excel files
+library(tidyr) 
+library(purrr)
+library(quantmod)
+library(fable.prophet)
+library(prophet)
+library(kableExtra)
+library(webshot2)
+```
+
+```{r}
+# Step 1: Read the data
+data <- read_excel("DATA/BUILDING_PERMITS_CANADA.xlsx", sheet = 1)
+
+# View the first few rows of the dataset
+head(data)
+
+# Reshape the data from wide to long format
+tidy_data <- data %>%
+  pivot_longer(
+    cols = starts_with("Jan-"), # Adjust to match the actual column patterns
+    names_to = "DATE",
+    values_to = "Value"
+  )
+
+# Separate the columns into specific data types if necessary
+tidy_data <- tidy_data %>%
+  rename(
+    `Types of work, total` = `Type of work 6`,
+    `Seasonal adjustment, value type` = `Seasonal adjustment, value type 4 5`,
+    `Geography` = Geography
+  )
+
+# Finalize the format
+tidy_data <- tidy_data %>%
+  select(
+    `Types of work, total`,
+    `Seasonal adjustment, value type`,
+    Geography,
+    DATE,
+    everything()
+  )
+
+# View the reshaped data
+print(tidy_data)
+
+# Step 2: Identify date columns (adjust based on your data)
+# Assuming all date columns start with a month abbreviation (e.g., "Jan-", "Feb-", etc.)
+date_columns <- grep("^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-", names(data), value = TRUE)
+
+# Step 3: Reshape data from wide to long format
+tidy_data <- data %>%
+  pivot_longer(
+    cols = all_of(date_columns),   # Only reshape the date columns
+    names_to = "DATE",             # New column for dates
+    values_to = "Value"            # New column for values
+  )
+
+# Step 4: Clean and reformat DATE column
+# Assuming dates are formatted as "MMM-YY" (e.g., "Jan-23"), convert them to proper date format
+tidy_data <- tidy_data %>%
+  mutate(
+    Value = as.numeric(Value),
+    DATE = as.Date(paste0("01-", DATE), format = "%d-%b-%y")  # Adding "01-" assumes day 1 for month-year
+  )
+
+# Step 5: Reorder columns to match the desired output
+tidy_data <- tidy_data %>%
+  select(
+    #`Type of work 6`,
+    #`Seasonal adjustment, value type 4 5`,
+    #File,
+    Geography,
+    DATE,
+    Value,
+    Variables,
+    `Type of building`
+  )
+
+# Step 6: Save the transformed data to a new CSV file
+write.csv(tidy_data, "Transformed_Building_Permits.csv", row.names = FALSE)
+
+# Preview of table properties
+print(glimpse(tidy_data))
+
+# Preview the transformed data
+print(knitr::kable(head(tidy_data)))
+
+print(knitr::kable(
+  tidy_data |>
+    filter(`Type of building` %in% c('Total non-residential','Total residential','Total residential and non-residential')) |>
+    group_by(Geography,`Type of building`,Variables) |>
+    summarise(Value = sum(Value), Count = n()) |>
+    mutate(Value = format(Value,big.mark = ',')) |>
+    select(Geography,`Type of building`,Variables, Value, Count)
+))
+```
+
+
+```{r}
+# Choose just the data we need to plot.
+filtered_data <- tidy_data |>
+  filter(`Type of building` %in% c('Total non-residential', 'Total residential', 'Total residential and non-residential')) |> 
+  filter(`Type of building` %in% c('Total residential')) |> 
+  #filter(`Geography` %in% c('Alberta','British Columbia','Ontario')) |> 
+  filter(`Variables` %in% c('Number of permits')) |> 
+  filter(`Geography` %in% c('British Columbia')) |> 
+  mutate(DATE = yearmonth(DATE)) |>
+  select(Geography,`Type of building`,Variables, Value, DATE) |>
+  #arrange(`Type of building`,Geography,Variables) |>
+  as_tsibble(index = DATE, key = c(Geography,`Type of building`,Variables))
+
+head(filtered_data)
+
+# Loop to generate and display plots for each category
+for (var in unique(filtered_data$Variables)) {
+  for (type in unique(filtered_data$`Type of building`)) {
+    for (geo in unique(filtered_data$Geography)) {
+      # Subset the data for the current combination
+      subset_data <- filtered_data |>
+        filter(Geography == geo, `Type of building` == type, Variables == var)
+
+      # Generate the plot
+      
+      p <- autoplot(subset_data, Value) +
+        geom_line(color = "blue") + 
+        labs(title = paste("Geography:", geo),y = var, x = type) +
+        theme_minimal()
+      
+      #par(mfrow = c(1, 2))
+      # Print the plot
+      print(p)
+      # par(mfrow = c(1,1))
+      
+      ggsave(paste0("images/","01_", geo, "_", type, "_", var, "_plot.jpg"), plot = p, width = 8, height = 6,create.dir = TRUE)
+      
+      data <- subset_data
+
+      #2. Split Data
+      #Split the data into training and testing sets for evaluation:
+      train_data <- data %>% filter(DATE < yearmonth("2024 May"))
+      test_data <- data %>% filter(DATE >= yearmonth("2024 May"))
+    }
+  }
+}
+```
+
+## ARIMA
+### Check for Stationarity
+```{r}
+# Plot ACF and PACF
+acf_plot <- ACF(train_data, Value) %>% autoplot() +
+  labs(title = "ACF Train Data") +
+  theme_minimal()
+
+pacf_plot <- PACF(train_data, Value) %>% autoplot() +
+  labs(title = "PACF Train Data") +
+  theme_minimal()
+
+ggsave(paste0("images/","02_acf_plot.jpg"), plot = acf_plot,create.dir = TRUE)
+ggsave(paste0("images/","02_pacf_plot.jpg"), plot = pacf_plot,create.dir = TRUE)
+
+print(acf_plot)
+print(pacf_plot)
+
+# Perform stationarity test
+library(urca)
+adf_test <- ur.df(train_data$Value, type = "drift")
+summary(adf_test)
+```
+
+### Fit ARIMA and Benchmark Models
+```{r}
+# Fit ARIMA model
+arima_model <- train_data %>% model(ARIMA(Value))
+
+# Fit benchmark models
+benchmark_models <- train_data %>% model(
+  Mean = MEAN(Value),
+  Naive = NAIVE(Value),
+  Drift = RW(Value ~ drift())
+)
+
+mean_Model <- train_data %>% model(
+  Mean = MEAN(Value)
+)
+
+naive_Model <- train_data %>% model(
+  Naive = NAIVE(Value)
+)
+
+drift_Model <- train_data %>% model(
+  Drift = RW(Value ~ drift())
+)
+```
+
+### Evaluate Models
+```{r}
+# Forecast using all models
+forecasts <- bind_rows(
+  arima_model %>% forecast(h = nrow(test_data)),
+  benchmark_models %>% forecast(h = nrow(test_data))
+)
+
+# Evaluate accuracy
+arima_accuracy_metrics <- forecasts %>%
+  accuracy(test_data)
+
+# Display evaluation
+print(arima_accuracy_metrics)
+```
+
+### Visualize forecasts and actual values
+```{r}
+arima_forecast_plot <-
+forecasts %>%
+  autoplot(data) +
+  labs(title = "Forecast vs Actual",
+       y = "Permits", x = "Date") +
+  theme_minimal()
+
+ggsave(paste0("images/","03_arima_forecast_plot.jpg"), plot = arima_forecast_plot,create.dir = TRUE)
+
+print(arima_forecast_plot)
+
+```
+
+
+### Residual Diagnostics for ARIMA and Benchmark Models
+```{r}
+plot <- gg_tsresiduals(drift_Model)
+ggsave("images/04_drift_residuals_plot.png", plot, width = 8, height = 6)
+print(plot)
+# png("images/04_drift_residuals_plot.png", width = 800, height = 600)
+# gg_tsresiduals(drift_Model)
+# dev.off()
+```
+
+### Statistical Tests: Box-Pierce and Ljung-Box
+```{r}
+# Augment model to extract residuals
+drift_aug <- drift_Model |> augment()
+
+# Perform Box-Pierce Test
+box_pierce_results <- drift_aug |>
+  features(.innov, box_pierce, lag = 10) |>
+  rename(Box_Pierce_pvalue = bp_pvalue)
+
+# Perform Ljung-Box Test
+ljung_box_results <- drift_aug |>
+  features(.innov, ljung_box, lag = 10) |>
+  rename(Ljung_Box_pvalue = lb_pvalue)
+
+# Combine the Results
+residual_tests <- bind_cols(
+  box_pierce_results |> select(Box_Pierce_pvalue),
+  ljung_box_results |> select(Ljung_Box_pvalue)
+)
+
+# Display the Results
+print(knitr::kable(residual_tests, caption = "Residual Diagnostic Tests (Box-Pierce & Ljung-Box)"))
+```
+
+## EXPONENTIAL SMOOTHING
+### Fit Models
+```{r}
+#Fit various exponential smoothing models to the training data.
+#Simple Exponential Smoothing (SES):
+ses_model <- train_data %>%
+model(SES = ETS(Value ~ error("A") + trend("N") + season("N")))
+
+#Holt’s Linear Trend Method:
+holt_model <- train_data %>%
+model(Holt = ETS(Value ~ error("A") + trend("A") + season("N")))
+
+#Holt-Winters Seasonal Methods:
+hw_additive_model <- train_data %>%
+model(HoltWinters_Additive = ETS(Value ~ error("A") + trend("A") + season("A")))
+hw_multiplicative_model <- train_data %>%
+model(HoltWinters_Multiplicative = ETS(Value ~ error("M") + trend("A") + season("M")))
+```
+
+### Forecast Future Values
+```{r}
+#Generate forecasts for the test period:
+forecasts <- bind_rows(
+  ses_model %>% forecast(h = nrow(test_data)),
+  holt_model %>% forecast(h = nrow(test_data)),
+  hw_additive_model %>% forecast(h = nrow(test_data)),
+  hw_multiplicative_model %>% forecast(h = nrow(test_data))
+)
+```
+
+### Evaluate Models
+```{r}
+#Calculate forecast accuracy using metrics like RMSE, MAE, and MAPE:
+exponential_smoothing_accuracy_metrics <- forecasts %>%
+  accuracy(test_data)
+
+print(exponential_smoothing_accuracy_metrics)
+```
+
+### Visualize Results
+```{r}
+#Plot the actual values and forecasts for each method:
+exponential_smooth_forecast_plot <- forecasts %>%
+autoplot(data) +
+labs(title = "Exponential Smoothing Forecast Comparisons", y = "Number of Permits", x = "Date") +
+theme_minimal()
+
+ggsave(paste0("images/","05_exponential_smooth_forecast_plot.jpg"), plot = exponential_smooth_forecast_plot,create.dir = TRUE)
+
+print(exponential_smooth_forecast_plot)
+#print(forecasts)
+```
+
+## NEURAL NETWORK AUTOREGRESSION (NNETAR) AND PROPHET
+### NNETAR
+```{r}
+nnetar_model <- train_data %>%
+  model(NNETAR = NNETAR(sqrt(Value)))
+
+# Forecast with NNETAR Model
+nnetar_forecast <- nnetar_model %>%
+  forecast(h = nrow(test_data))
+
+# Plot NNETAR Forecast
+nnetar_forecast_plot <- autoplot(nnetar_forecast, data) +
+  labs(title = "NNETAR Forecast", y = "Building Permits", x = "Date") +
+  theme_minimal()
+
+ggsave(paste0("images/","06_nnetar_forecast_plot.jpg"), plot = nnetar_forecast_plot,create.dir = TRUE)
+
+print(nnetar_forecast_plot)
+
+nnetar_accuracy <- nnetar_forecast %>%
+  accuracy(test_data)
+
+# Combine Accuracy Metrics
+nnetar_accuracy <- bind_rows(
+  mutate(nnetar_accuracy, .model = "NNETAR")
+)
+
+# Display Accuracy Metrics
+print(knitr::kable(nnetar_accuracy, caption = "NNETAR Model Accuracy"))
+```
+
+### Prophet model
+```{r}
+# Define the training dataset with proper dates
+N <- nrow(data)
+n <- 5 # Number of periods to forecast
+
+# Create the training data
+train_dates <- data$DATE[1:(N - n)] # Use actual dates
+train_values <- data$Value[1:(N - n)]
+
+# Create a data frame for Prophet
+df_prophet <- data.frame(ds = train_dates, y = train_values) # ds = dates, y = values
+head(df_prophet) # Verify the structure
+
+# Fit the Prophet model
+m <- prophet(df_prophet)
+
+# Generate future dates starting after the last date in the training data
+future_prophet <- make_future_dataframe(m, periods = n, freq = "month")
+tail(future_prophet) # Verify the future dates
+
+# Forecast the future values
+forecast_prophet <- predict(m, future_prophet)
+
+forecast_data <- forecast_prophet %>%
+  inner_join(test_data, by = c("ds" = "DATE")) %>%  # Match forecast dates with test_data dates
+  select(ds, yhat, yhat_lower, yhat_upper)  # Select necessary columns from the forecast
+
+# Create the plot
+prophet_forecast_plot <- ggplot() +
+  # Plot training data
+  geom_line(data = df_prophet, aes(x = ds, y = y, color = "Training Data"), size = 1, alpha = 0.6) +
+  # Plot actual test data
+  geom_line(data = test_data, aes(x = DATE, y = Value, color = "Actual Test Data"), size = 1, alpha = 0.8) +
+  # Plot forecasted values
+  geom_line(data = forecast_data, aes(x = ds, y = yhat, color = "Forecasted Values"), size = 1) +
+  # Add confidence interval
+  geom_ribbon(data = forecast_data, aes(x = ds, ymin = yhat_lower, ymax = yhat_upper, fill = "Confidence Interval"), alpha = 0.3) +
+  # Customize colors and labels for the legend
+  scale_color_manual(
+    name = "Legend",
+    values = c("Training Data" = "black", "Actual Test Data" = "blue", "Forecasted Values" = "red")
+  ) +
+  scale_fill_manual(
+    name = "Legend",
+    values = c("Confidence Interval" = "grey")
+  ) +
+  # Add title and labels
+  ggtitle("Prophet Forecast with Actual and Training Data") +
+  labs(
+    x = "Date",
+    y = "Building Permits"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")  # Place legend at the right
+
+ggsave("images/07_forecast_prophet_plot.jpg", plot = prophet_forecast_plot, width = 8, height = 6)
+
+print(prophet_forecast_plot)
+
+#Plot forecast components (trend, seasonality)
+print(prophet_plot_components(m, forecast_prophet))  # Generate the base plot
+
+# Plot forecast components (trend, seasonality)
+png("images/07_prophet_components_plot.png", width = 800, height = 600)
+prophet_plot_components(m, forecast_prophet)
+dev.off()
+
+# Extract the test data
+test_dates <- test_data$DATE # Dates of the test data
+test_values <- test_data$Value # Actual values of the test data
+
+# Subset the forecast to match the test dates
+forecast_subset <- forecast_prophet %>%
+  filter(as.Date(ds) %in% as.Date(test_dates)) %>%
+  select(ds, yhat)
+
+# Combine actual and forecasted values
+performance_data <- data.frame(
+  ds = test_dates,
+  actual = test_values,
+  predicted = forecast_subset$yhat
+)
+
+# Calculate accuracy metrics
+rmse <- sqrt(mean((performance_data$actual - performance_data$predicted)^2))
+mae <- mean(abs(performance_data$actual - performance_data$predicted))
+mape <- mean(abs((performance_data$actual - performance_data$predicted) / performance_data$actual)) * 100
+
+# Display the results
+prophet_accuracy <- data.frame(
+  .model = "PROPHET",
+  RMSE = rmse,
+  MAE = mae,
+  MAPE = mape
+)
+
+print(knitr::kable(prophet_accuracy, caption = "Prophet Model Accuracy"))
+```
+
+
+## ACCURACY COMPARISION MODELS PERFORMANCE
+### Merge and print the accuracy metrics
+
+```{r}
+# Merge the accuracy metrics
+joined_accuracy_metrics <- bind_rows(
+  arima_accuracy_metrics,
+  exponential_smoothing_accuracy_metrics,
+  prophet_accuracy,
+  nnetar_accuracy
+)
+
+# Select key metrics and arrange by RMSE
+evaluation_summary <- joined_accuracy_metrics %>%
+  select(.model, RMSE, MAE, MAPE) %>%
+  arrange(RMSE)
+
+# Display the summary in a table
+png("images/08_model_evaluation_summary.png", width = 800, height = 600)
+
+# Open a new plot window
+grid::grid.newpage()
+
+# Print the table using knitr::kable
+grid::grid.draw(
+  gridExtra::tableGrob(
+    evaluation_summary,
+    theme = gridExtra::ttheme_default(core = list(fg_params = list(cex = 0.8))),
+    rows = NULL
+  )
+)
+
+dev.off()
+
+print(knitr::kable(evaluation_summary, caption = "Model Evaluation Summary"))
+```
